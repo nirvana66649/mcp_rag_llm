@@ -52,8 +52,7 @@ async def chat_endpoint(request_data: dict):
         return {
             "status": "success",
             "data": {
-                "response": response,
-                "session_id": session_id
+                "response": response
             }
         }
     except Exception as e:

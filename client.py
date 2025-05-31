@@ -1,12 +1,11 @@
 import asyncio
 import os
 import json
-from datetime import datetime
-import re
+from datetime import datetime, timedelta
 from openai import OpenAI
 from dotenv import load_dotenv
 from langchain.memory import ConversationBufferWindowMemory
-from langchain_mongodb.chat_message_histories import MongoDBChatMessageHistory
+from utils.custom_mongo_history import CustomMongoChatMessageHistory
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 from pymongo import MongoClient
 import uuid
@@ -14,7 +13,6 @@ from typing import Optional
 from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
 load_dotenv()
 
 
@@ -32,8 +30,39 @@ def safe_messages_to_dict(messages):
     return result
 
 
+def get_system_prompt_from_file(file_path: str = "system_prompt.txt") -> str:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"未找到 system prompt 文件: {file_path}")
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        template = f.read()
+
+    current_time = datetime.now()
+    context = {
+        "current_date": current_time.strftime("%Y年%m月%d日"),
+        "current_datetime": current_time.strftime("%Y年%m月%d日 %H:%M:%S"),
+        "weekday_cn": {
+            "Monday": "星期一",
+            "Tuesday": "星期二",
+            "Wednesday": "星期三",
+            "Thursday": "星期四",
+            "Friday": "星期五",
+            "Saturday": "星期六",
+            "Sunday": "星期日"
+        }.get(current_time.strftime("%A"), "未知"),
+        "tomorrow": (current_time + timedelta(days=1)).strftime('%Y年%m月%d日')
+    }
+
+    # 替换模板中的变量
+    for key, value in context.items():
+        template = template.replace(f"{{{{{key}}}}}", value)
+
+    return template
+
+
+
 class MCPClient:
-    def __init__(self,server_script_path: str):
+    def __init__(self, server_script_path: str, session_id: Optional[str] = None):
         self.exit_stack = AsyncExitStack()
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("BASE_URL")
@@ -43,12 +72,14 @@ class MCPClient:
         self.client = OpenAI(api_key=self.openai_api_key, base_url=self.base_url)
 
         self.mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
-        self.mongo_db = self.mongo_client["chat_memory_db"]
+        self.mongo_db = self.mongo_client["chat_memory"]
         self.collection_name = "mcp_memory"
-        self.memory_id = str(uuid.uuid4())
 
-        # ✅ 新用法：langchain_mongodb 中的 MongoDBChatMessageHistory
-        chat_history = MongoDBChatMessageHistory(
+        # ✅ 使用传入的 session_id，否则生成一个新的 UUID
+        self.memory_id = session_id or str(uuid.uuid4())
+
+        # 构造 memory（保持你的逻辑）
+        chat_history = CustomMongoChatMessageHistory(
             session_id=self.memory_id,
             connection_string=os.getenv("MONGO_URI", "mongodb://localhost:27017"),
             database_name="chat_memory",
@@ -63,7 +94,7 @@ class MCPClient:
         )
 
         self.session: Optional[ClientSession] = None
-        self.server_script_path = server_script_path  # 添加服务器路径参数
+        self.server_script_path = server_script_path
 
     async def __aenter__(self):
         await self.connect_to_server(self.server_script_path)
@@ -90,6 +121,7 @@ class MCPClient:
         print("\n已连接到服务器，支持以下工具:", [tool.name for tool in tools])
 
     async def process_query(self, query: str) -> str:
+        # 1. 获取当前所有可用的工具列表
         response = await self.session.list_tools()
         available_tools = [
             {
@@ -102,38 +134,52 @@ class MCPClient:
             } for tool in response.tools
         ]
 
+        # 2. 获取历史消息记录（从 memory 中读出最近 20 条，已由 MongoDB 限制）
         history_messages = self.memory.chat_memory.messages
         messages = safe_messages_to_dict(history_messages)
 
-        if not messages:
-            messages.append({"role": "system", "content": "你是一个智能助手。"})
+        # 3. 插入或更新 system prompt，确保首条消息为系统设定
+        current_system_prompt = get_system_prompt_from_file("system_prompt.txt")
+        if not messages or messages[0]["role"] != "system":
+            messages.insert(0, {"role": "system", "content": current_system_prompt})
+        else:
+            messages[0]["content"] = current_system_prompt
 
+        # 4. 将用户输入添加到对话中
         messages.append({"role": "user", "content": query})
 
+        # 5. 输出当前请求调试信息
         print(f"\n[查询] 用户查询: {query}")
+        print(f"[时间] 当前系统时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"[工具] 可用工具: {[tool['function']['name'] for tool in available_tools]}")
 
         try:
+            # 6. 初次向模型发送请求（包含工具选择）
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 tools=available_tools,
-                tool_choice="auto"
+                tool_choice="auto"  # 让模型自动决定是否调用工具
             )
 
+            # 7. 获取模型回复
             assistant_message = response.choices[0].message
+
+            # 8. 追加 assistant 回复消息（包含可能的 tool_calls）
             messages.append({
                 "role": "assistant",
                 "content": assistant_message.content,
                 "tool_calls": assistant_message.tool_calls
             })
 
+            # 9. 如果模型决定调用工具
             if assistant_message.tool_calls:
                 print(f"\n[工具调用] 模型决定调用 {len(assistant_message.tool_calls)} 个工具")
 
                 for tool_call in assistant_message.tool_calls:
                     tool_name = tool_call.function.name
                     try:
+                        # 解析工具调用参数
                         tool_args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
                         tool_args = {}
@@ -142,11 +188,13 @@ class MCPClient:
                     print(f"[参数] {tool_args}")
 
                     try:
+                        # 执行工具调用
                         result = await self.session.call_tool(tool_name, tool_args)
                         tool_result = result.content[0].text if result.content else "工具执行完成"
 
                         print(f"[成功] 工具 {tool_name} 执行成功")
 
+                        # 添加 tool 回复到消息列表
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -161,54 +209,35 @@ class MCPClient:
                             "content": f"工具执行失败: {str(e)}"
                         })
 
+                # 10. 第二次向模型发送请求（携带 tool 调用结果），得到最终输出
                 final_response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages
                 )
                 final_output = final_response.choices[0].message.content
+
             else:
+                # 如果没有工具调用，直接使用第一次模型回复的内容
                 final_output = assistant_message.content
 
         except Exception as e:
+            # 捕获整个处理流程中的异常
             print(f"[错误] 处理查询时发生错误: {str(e)}")
             final_output = f"抱歉，处理您的请求时发生了错误: {str(e)}"
 
+        # 11. 将当前轮对话追加进记忆（memory 本身已限制最多20条）
         self.memory.chat_memory.add_user_message(query)
         self.memory.chat_memory.add_ai_message(final_output)
 
-        self.save_conversation_log(query, final_output)
-
+        # 12. 返回最终输出结果
         return final_output
 
-    def save_conversation_log(self, query: str, response: str):
-        def clean_filename(text: str) -> str:
-            text = text.strip()
-            text = re.sub(r'[\\/:*?"<>|]', '', text)
-            return text[:50]
-
-        safe_filename = clean_filename(query)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{safe_filename}_{timestamp}.txt"
-        output_dir = "./llm_outputs"
-        os.makedirs(output_dir, exist_ok=True)
-        file_path = os.path.join(output_dir, filename)
-
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(f"🗣 用户提问：{query}\n\n")
-            f.write(f"🤖 模型回复：\n{response}\n")
-
-        print(f"📄 对话记录已保存为：{file_path}")
-
     async def chat_loop(self):
-        print("\n[启动] MCP 客户端已启动！输入 'quit' 退出")
-        print("[提示] 你可以尝试以下命令：")
-        print("   - 搜索小米汽车的新闻")
-        print("   - 分析一下这段文字的情感：[你的文字]")
-        print("   - 查询数据库中的预约记录")
-        print("   - 修改用户张三的预约时间为明天下午2点")
-        print("   - 发送邮件到 example@email.com")
-        print("   - 搜索关于北京协和医院的信息")
-        print("   - 清理文件夹文件")
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n🤖 医疗助手已启动！当前时间：{current_time}")
+        print("💡 输入 'quit' 退出对话")
+        print("🕒 助手已配置最新时间信息，可以准确回答时间相关问题")
+        print("-" * 50)
 
         while True:
             try:
@@ -231,9 +260,12 @@ class MCPClient:
 
     async def cleanup(self):
         await self.exit_stack.aclose()
+
+
 async def main():
     server_script_path = "D:\\PythonProject\\mcp-project\\server.py"
-    client = MCPClient()
+    session_id = "test_user_001"  # ✅ 你可以换成动态获取的用户名或 ID
+    client = MCPClient(server_script_path, session_id=session_id)
     try:
         await client.connect_to_server(server_script_path)
         await client.chat_loop()
@@ -243,5 +275,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
